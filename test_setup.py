@@ -47,6 +47,13 @@ def test_dependencies():
         print("[FAIL] transformers not found")
         return False
 
+    try:
+        import sentencepiece
+        print("[OK] sentencepiece")
+    except ImportError:
+        print("[FAIL] sentencepiece not found")
+        return False
+
     return True
 
 def test_embedding_model():
