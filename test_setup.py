@@ -54,6 +54,13 @@ def test_dependencies():
         print("[FAIL] sentencepiece not found")
         return False
 
+    try:
+        import google.protobuf
+        print("[OK] protobuf")
+    except ImportError:
+        print("[FAIL] protobuf not found")
+        return False
+
     return True
 
 def test_embedding_model():
