@@ -12,8 +12,8 @@ async def test_scraper():
     scraper = AimeLeonDoreScraper()
 
     try:
-        # Only get a few product URLs for testing - use non-headless to see what's happening
-        product_urls = await scraper._scrape_product_urls_headless()
+        # Only get a few product URLs for testing
+        product_urls = await scraper._scrape_product_urls_requests()
         test_urls = product_urls[:2]  # Only test with 2 products
 
         print(f"Testing with {len(test_urls)} products: {test_urls}")

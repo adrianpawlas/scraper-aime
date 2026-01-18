@@ -113,7 +113,19 @@ class AimeLeonDoreScraper:
 
     async def scrape_product_urls(self) -> List[str]:
         """Scrape all product URLs from the shop-all collection page."""
-        logger.info("Starting to scrape product URLs...")
+        # Check if running in CI environment
+        is_ci = os.getenv('CI') == 'true' or os.getenv('GITHUB_ACTIONS') == 'true'
+
+        if is_ci:
+            logger.info("Running in CI environment, using requests-based scraping...")
+            return await self._scrape_product_urls_requests()
+        else:
+            logger.info("Running locally, using Selenium for full scraping...")
+            return await self._scrape_product_urls_selenium()
+
+    async def _scrape_product_urls_selenium(self) -> List[str]:
+        """Scrape product URLs using Selenium (for local development)."""
+        logger.info("Starting to scrape product URLs with Selenium...")
         product_urls = set()
 
         driver = self.setup_selenium_driver()
@@ -167,14 +179,17 @@ class AimeLeonDoreScraper:
             logger.info(f"Total unique product URLs found: {len(product_urls)}")
 
         except Exception as e:
-            logger.error(f"Error scraping product URLs: {e}")
+            logger.error(f"Error scraping product URLs with Selenium: {e}")
+            # Fallback to requests method
+            logger.info("Falling back to requests-based scraping...")
+            return await self._scrape_product_urls_requests()
         finally:
             driver.quit()
 
         return list(product_urls)
 
-    async def _scrape_product_urls_headless(self) -> List[str]:
-        """Alternative method to scrape product URLs using requests (for testing)."""
+    async def _scrape_product_urls_requests(self) -> List[str]:
+        """Scrape product URLs using requests (for CI environments)."""
         logger.info("Starting to scrape product URLs with requests...")
         product_urls = []
 
@@ -202,6 +217,7 @@ class AimeLeonDoreScraper:
             logger.error(f"Error scraping product URLs with requests: {e}")
 
         return product_urls
+
 
     async def download_image(self, session: aiohttp.ClientSession, image_url: str) -> Optional[bytes]:
         """Download image from URL."""

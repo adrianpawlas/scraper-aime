@@ -51,7 +51,6 @@ jobs:
       env:
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-        CHROME_BIN: /usr/bin/google-chrome-stable
       run: |
         if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
           echo "Running in test mode..."
