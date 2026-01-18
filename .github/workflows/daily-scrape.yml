@@ -43,17 +43,15 @@ jobs:
         pip install -r requirements.txt
 
     - name: Set up Chrome
-      run: |
-        # Install Chrome for Selenium
-        wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
-        echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list
-        apt-get update
-        apt-get install -y google-chrome-stable
+      uses: browser-actions/setup-chrome@v1
+      with:
+        chrome-version: stable
 
     - name: Run scraper
       env:
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        CHROME_BIN: /usr/bin/google-chrome-stable
       run: |
         if [ "${{ github.event.inputs.test_mode }}" = "true" ]; then
           echo "Running in test mode..."
