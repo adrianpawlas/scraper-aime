@@ -61,7 +61,37 @@ create table public.products (
 
 ## Usage
 
-### Full Scraper (Recommended)
+### Automated (GitHub Actions)
+The scraper runs automatically every day at midnight UTC. You can also trigger it manually:
+
+1. Go to your [GitHub repository](https://github.com/adrianpawlas/scraper-aime)
+2. Click on the "Actions" tab
+3. Click "Daily Product Scraper" workflow
+4. Click "Run workflow" button
+5. Choose whether to run in test mode or full mode
+
+### Local Setup (Manual Run)
+
+#### Prerequisites
+- Python 3.11+
+- Chrome browser installed
+- Supabase account with the products table
+
+#### Installation
+```bash
+git clone https://github.com/adrianpawlas/scraper-aime.git
+cd scraper-aime
+pip install -r requirements.txt
+```
+
+#### Environment Variables
+Create a `.env` file with your Supabase credentials:
+```bash
+SUPABASE_URL=https://yqawmzggcgpeyaaynrjk.supabase.co
+SUPABASE_ANON_KEY=your-anon-key-here
+```
+
+#### Full Scraper (Recommended)
 Run the complete scraper:
 
 ```bash
@@ -70,14 +100,14 @@ python run.py
 
 This will scrape all products from the catalog.
 
-### Test Version
+#### Test Version
 For testing with just a few products:
 
 ```bash
 python test_scraper.py
 ```
 
-### Manual Run
+#### Manual Run
 You can also import and run the scraper directly:
 
 ```python
@@ -150,6 +180,35 @@ Logs are saved to `scraper.log` with daily rotation. Check this file for detaile
 - **Memory Issues**: Large catalogs might require significant RAM for embeddings
 - **Rate Limiting**: The scraper includes delays but may still hit rate limits
 - **Database Errors**: Check your Supabase connection and table structure
+
+## GitHub Actions Setup
+
+To set up automated daily runs:
+
+1. Go to your repository settings
+2. Click "Secrets and variables" → "Actions"
+3. Add these repository secrets:
+   - `SUPABASE_URL`: Your Supabase project URL
+   - `SUPABASE_ANON_KEY`: Your Supabase anon key
+
+The workflow will run automatically every day at midnight UTC and can also be triggered manually.
+
+## Project Structure
+
+```
+scraper-aime/
+├── .github/
+│   └── workflows/
+│       └── daily-scrape.yml    # GitHub Actions workflow
+├── scraper.py                  # Main scraper module
+├── run.py                      # Full scraper runner
+├── test_scraper.py             # Test runner (few products)
+├── test_setup.py               # Setup verification
+├── requirements.txt            # Python dependencies
+├── README.md                   # This file
+├── .gitignore                  # Git ignore rules
+└── scraper.log                 # Generated log file
+```
 
 ## Legal Note
 
