@@ -193,6 +193,8 @@ To set up automated daily runs:
 
 The workflow will run automatically every day at midnight UTC and can also be triggered manually.
 
+**Status**: ✅ Workflow is ready and fixed for GitHub Actions environment
+
 ## Project Structure
 
 ```
