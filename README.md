@@ -95,10 +95,10 @@ SUPABASE_ANON_KEY=your-anon-key-here
 Run the complete scraper:
 
 ```bash
-python run.py
+python manual_run.py
 ```
 
-This will scrape all products from the catalog.
+This will scrape all products from the catalog. The script will check for required environment variables and provide helpful error messages.
 
 #### Test Version
 For testing with just a few products:
