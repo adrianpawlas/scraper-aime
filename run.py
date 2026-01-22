@@ -12,15 +12,8 @@ async def main():
     scraper = AimeLeonDoreScraper()
 
     try:
-        # Step 1: Scrape all product URLs
-        print("Step 1: Scraping product URLs...")
-        product_urls = await scraper.scrape_product_urls()
-        print(f"Found {len(product_urls)} products to process")
-
-        # Step 2: Process all products
-        print("Step 2: Processing products and generating embeddings...")
-        await scraper.process_products(product_urls)
-
+        # Run the complete scraper (includes verification)
+        await scraper.run()
         print("Scraping completed successfully!")
 
     except Exception as e:

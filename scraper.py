@@ -369,9 +369,14 @@ class AimeLeonDoreScraper:
                     if colors:
                         metadata['colors'] = colors
 
-                # Check if sold out
-                sold_out = soup.find('span', string=re.compile(r'sold out|out of stock', re.I))
-                metadata['availability'] = 'sold_out' if sold_out else 'available'
+                # Check if sold out - multiple methods
+                sold_out_text = soup.find(string=re.compile(r'sold out|out of stock|unavailable', re.I))
+                sold_out_button = soup.find('button', {'disabled': True, 'class': re.compile(r'add.*cart|buy', re.I)})
+                sold_out_class = soup.find(class_=re.compile(r'sold.*out|out.*stock|unavailable', re.I))
+                
+                is_sold_out = bool(sold_out_text or sold_out_button or sold_out_class)
+                metadata['availability'] = 'sold_out' if is_sold_out else 'available'
+                product_data['is_sold_out'] = is_sold_out
 
                 product_data['metadata'] = json.dumps(metadata)
 
@@ -380,6 +385,7 @@ class AimeLeonDoreScraper:
                 if not product_id:
                     product_id = str(hash(product_url)) % 1000000
                 product_data['id'] = f"aime-{product_id}"
+                product_data['url'] = product_url  # Store URL directly for easier access
 
                 return product_data
 
@@ -387,9 +393,14 @@ class AimeLeonDoreScraper:
             logger.error(f"Error scraping product {product_url}: {e}")
             return None
 
-    async def process_products(self, product_urls: List[str], batch_size: int = 10):
-        """Process all products: scrape details, generate embeddings, and store in database."""
+    async def process_products(self, product_urls: List[str], batch_size: int = 10) -> int:
+        """Process all products: scrape details, generate embeddings, and store in database.
+        
+        Returns:
+            int: Number of products successfully processed and stored
+        """
         logger.info(f"Processing {len(product_urls)} products...")
+        products_stored = 0
 
         async with aiohttp.ClientSession() as session:
             # Process in batches to avoid overwhelming the server
@@ -404,12 +415,16 @@ class AimeLeonDoreScraper:
                 # Scrape product details
                 batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Filter out exceptions and None results
+                # Filter out exceptions, None results, and sold-out products
                 valid_products = []
                 for result in batch_results:
                     if isinstance(result, Exception):
                         logger.error(f"Exception in batch: {result}")
                     elif result is not None:
+                        # Skip sold-out products
+                        if result.get('is_sold_out', False):
+                            logger.info(f"Skipping sold-out product: {result.get('title', 'Unknown')}")
+                            continue
                         valid_products.append(result)
 
                 logger.info(f"Valid products in batch: {len(valid_products)}")
@@ -434,21 +449,31 @@ class AimeLeonDoreScraper:
                             logger.warning(f"No image URL for {product['id']}")
                             continue
 
+                        # Extract product URL - prefer direct field, fallback to metadata
+                        product_url = product.get('url')
+                        if not product_url:
+                            try:
+                                if product.get('metadata'):
+                                    metadata_dict = json.loads(product['metadata'])
+                                    product_url = metadata_dict.get('url')
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
                         # Prepare data for Supabase
                         db_product = {
                             'id': product['id'],
                             'source': 'scraper',
-                            'product_url': product.get('metadata') and json.loads(product['metadata']).get('url'),
+                            'product_url': product_url,
                             'image_url': product['image_url'],
                             'brand': 'Aime',
                             'title': product['title'],
-                            'description': product['description'],
-                            'category': product['category'],
+                            'description': product.get('description'),
+                            'category': product.get('category'),
                             'gender': 'man',
-                            'price': product['price'],
+                            'price': product.get('price'),
                             'currency': 'USD',
                             'second_hand': False,
-                            'metadata': product['metadata'],
+                            'metadata': product.get('metadata'),
                             'size': product.get('size'),
                             'country': 'US',
                             'embedding': product['embedding']
@@ -457,19 +482,58 @@ class AimeLeonDoreScraper:
                         # Remove None values
                         db_product = {k: v for k, v in db_product.items() if v is not None}
 
-                        # Insert into Supabase
-                        result = self.supabase.table('products').upsert(db_product).execute()
-
-                        if result.data:
-                            logger.info(f"Successfully stored product: {product['title']}")
-                        else:
-                            logger.error(f"Failed to store product: {product['title']}")
+                        # Insert into Supabase with better error handling
+                        try:
+                            result = self.supabase.table('products').upsert(db_product).execute()
+                            
+                            # Check if insertion was successful
+                            if hasattr(result, 'data') and result.data:
+                                logger.info(f"Successfully stored product: {product['title']} (ID: {product['id']})")
+                                products_stored += 1
+                            elif hasattr(result, 'data') and result.data == []:
+                                # Empty response might still be success for upsert
+                                logger.info(f"Upsert completed for product: {product['title']} (ID: {product['id']})")
+                                products_stored += 1
+                            else:
+                                logger.warning(f"Unexpected response for product {product['title']}: {result}")
+                                
+                            # Log the actual response for debugging (only in debug mode)
+                            if logger.level == "DEBUG":
+                                logger.debug(f"Supabase response: {result}")
+                            
+                        except Exception as db_error:
+                            logger.error(f"Database error storing product {product['title']} (ID: {product['id']}): {db_error}")
+                            logger.error(f"Product data: {db_product}")
+                            raise  # Re-raise to see the full error
 
                     except Exception as e:
                         logger.error(f"Error processing product {product.get('id', 'unknown')}: {e}")
 
                 # Small delay between batches
                 await asyncio.sleep(1)
+
+        logger.info(f"Processing complete. Successfully stored {products_stored} products.")
+        return products_stored
+
+    async def verify_database_insertion(self, expected_count: int):
+        """Verify that products were actually inserted into the database."""
+        try:
+            # Query products with source='scraper' and brand='Aime' from today
+            result = self.supabase.table('products').select('id', count='exact').eq('source', 'scraper').eq('brand', 'Aime').execute()
+            
+            total_count = result.count if hasattr(result, 'count') else len(result.data) if result.data else 0
+            
+            logger.info(f"Database verification: Found {total_count} products in database (expected at least {expected_count})")
+            
+            if total_count == 0:
+                logger.warning("⚠️  No products found in database! There may be an insertion issue.")
+            elif total_count < expected_count:
+                logger.warning(f"⚠️  Only {total_count} products found, expected {expected_count}. Some products may not have been inserted.")
+            else:
+                logger.info(f"✅ Successfully verified {total_count} products in database")
+                
+        except Exception as e:
+            logger.error(f"Error verifying database: {e}")
 
     async def run(self):
         """Main scraping function."""
@@ -481,12 +545,18 @@ class AimeLeonDoreScraper:
             logger.info(f"Found {len(product_urls)} products to process")
 
             # Step 2: Process all products
-            await self.process_products(product_urls)
+            products_processed = await self.process_products(product_urls)
+
+            # Step 3: Verify database insertion
+            logger.info("Verifying database insertion...")
+            await self.verify_database_insertion(products_processed)
 
             logger.info("Scraping completed successfully!")
 
         except Exception as e:
             logger.error(f"Scraping failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
 
 
