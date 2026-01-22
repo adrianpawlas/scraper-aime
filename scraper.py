@@ -369,12 +369,32 @@ class AimeLeonDoreScraper:
                     if colors:
                         metadata['colors'] = colors
 
-                # Check if sold out - multiple methods
-                sold_out_text = soup.find(string=re.compile(r'sold out|out of stock|unavailable', re.I))
-                sold_out_button = soup.find('button', {'disabled': True, 'class': re.compile(r'add.*cart|buy', re.I)})
-                sold_out_class = soup.find(class_=re.compile(r'sold.*out|out.*stock|unavailable', re.I))
+                # Check if sold out - very conservative approach
+                # Default to AVAILABLE, only mark as sold out if we find explicit evidence
+                is_sold_out = False
                 
-                is_sold_out = bool(sold_out_text or sold_out_button or sold_out_class)
+                # Look for buttons with exact "Sold Out" or "Out of Stock" text
+                all_buttons = soup.find_all('button')
+                for button in all_buttons:
+                    button_text = button.get_text(strip=True).lower()
+                    # Only match exact phrases to avoid false positives
+                    if button_text in ['sold out', 'out of stock', 'unavailable']:
+                        is_sold_out = True
+                        break
+                
+                # If no explicit sold-out button found, check for disabled add-to-cart with sold-out text
+                if not is_sold_out:
+                    # Find add-to-cart buttons
+                    cart_buttons = soup.find_all('button', string=re.compile(r'add|cart|buy', re.I))
+                    for button in cart_buttons:
+                        is_disabled = button.get('disabled') is not None
+                        button_text = button.get_text(strip=True).lower()
+                        # Only mark as sold out if button is disabled AND explicitly says sold out
+                        if is_disabled and ('sold out' in button_text or 'out of stock' in button_text):
+                            is_sold_out = True
+                            break
+                
+                # Default to available - only mark sold out if we found clear evidence
                 metadata['availability'] = 'sold_out' if is_sold_out else 'available'
                 product_data['is_sold_out'] = is_sold_out
 
