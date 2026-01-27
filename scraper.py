@@ -272,6 +272,119 @@ class AimeLeonDoreScraper:
             logger.error(f"Error generating embedding: {e}")
             return None
 
+    def _parse_price_with_currency(self, text: str) -> Optional[Tuple[float, str]]:
+        """Parse price string to (value, currency_code). Returns None if not parseable."""
+        if not text or not isinstance(text, str):
+            return None
+        text = text.strip().replace(',', '').replace('\u00a0', ' ')
+        sym_to_cur = {'$': 'USD', '€': 'EUR', '£': 'GBP', '¥': 'JPY'}
+        # $20 or €75 or £50
+        m = re.search(r'([$€£¥])\s*(\d+(?:\.\d{2})?)', text)
+        if m:
+            return (float(m.group(2)), sym_to_cur.get(m.group(1), 'USD'))
+        # 20 USD, 450 CZK, 75.50 PLN, 50 Kč
+        m = re.search(r'(\d+(?:\.\d{2})?)\s*([A-Za-z]{3}|Kč)', text, re.I)
+        if m:
+            cur = 'CZK' if m.group(2).lower() in ('kč', 'kc') else m.group(2).upper()
+            return (float(m.group(1)), cur)
+        # 20USD, 450CZK (no space)
+        m = re.search(r'(\d+(?:\.\d{2})?)\s*([A-Za-z]{3})\b', text, re.I)
+        if m:
+            return (float(m.group(1)), m.group(2).upper())
+        # $20.00 fallback
+        m = re.search(r'\$(\d+(?:\.\d{2})?)', text)
+        if m:
+            return (float(m.group(1)), 'USD')
+        return None
+
+    def _format_price_part(self, val: float, cur: str) -> str:
+        """Format as 20USD or 20.5USD (strip trailing zeros)."""
+        s = f"{val:g}{cur}"  # 95.0 -> "95USD", 95.5 -> "95.5USD"
+        return s
+
+    def _extract_multi_currency_prices(self, soup: BeautifulSoup, is_sale: bool) -> Optional[str]:
+        """
+        Extract prices in all available currencies. Returns comma-separated "20USD,450CZK,75PLN"
+        or None. For is_sale=True returns sale prices or None when no sale.
+        """
+        collected = []  # list of "valueCUR"
+        seen_cur = set()
+
+        def add_price(p: float, cur: str) -> None:
+            cur = cur.upper()
+            if cur not in seen_cur:
+                seen_cur.add(cur)
+                collected.append(self._format_price_part(p, cur))
+
+        # 1) JSON-LD product schema
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(script.string) if script.string else {}
+                if isinstance(data, dict):
+                    data = [data]
+                for item in data:
+                    if item.get('@type') == 'Product' and 'offers' in item:
+                        offers = item['offers']
+                        if isinstance(offers, dict):
+                            offers = [offers]
+                        for off in offers:
+                            if is_sale:
+                                price = off.get('price') or off.get('lowPrice')
+                            else:
+                                price = off.get('price') or off.get('highPrice') or off.get('lowPrice')
+                            if price is None:
+                                continue
+                            try:
+                                p = float(price)
+                            except (TypeError, ValueError):
+                                continue
+                            cur = (off.get('priceCurrency') or 'USD').upper()
+                            add_price(p, cur)
+            except (json.JSONDecodeError, TypeError, KeyError):
+                continue
+
+        # 2) Meta tags (usually main/regular price)
+        if not is_sale:
+            amount = soup.find('meta', {'property': 'product:price:amount'})
+            currency = soup.find('meta', {'property': 'product:price:currency'})
+            if amount and amount.get('content'):
+                try:
+                    p = float(amount['content'].replace(',', ''))
+                    cur = (currency.get('content', 'USD') if currency else 'USD').upper()
+                    add_price(p, cur)
+                except (ValueError, TypeError):
+                    pass
+
+        # 3) Price elements: regular vs sale (by class name)
+        price_class_re = re.compile(r'price', re.I)
+        sale_class_re = re.compile(r'sale|compare|discount|was', re.I)
+        for elem in soup.find_all(['span', 'div', 'p'], class_=price_class_re):
+            cls = ' '.join(elem.get('class', []))
+            elem_is_sale = bool(sale_class_re.search(cls))
+            if elem_is_sale != is_sale:
+                continue
+            text = elem.get_text(strip=True)
+            parsed = self._parse_price_with_currency(text)
+            if parsed:
+                val, cur = parsed
+                add_price(val, cur)
+
+        # 4) data-price / data-currency attributes
+        for elem in soup.find_all(attrs={'data-price': True}):
+            data_sale = 'sale' in ' '.join(elem.get('class', [])).lower() or elem.get('data-sale') in ('true', '1')
+            if data_sale != is_sale:
+                continue
+            try:
+                p = float(str(elem['data-price']).replace(',', ''))
+                cur = (elem.get('data-currency') or 'USD').upper()
+                add_price(p, cur)
+            except (ValueError, TypeError, KeyError):
+                pass
+
+        if not collected:
+            return None
+        return ','.join(collected)
+
     async def scrape_product_details(self, session: aiohttp.ClientSession, product_url: str) -> Optional[Dict]:
         """Scrape detailed product information from individual product page."""
         try:
@@ -300,23 +413,19 @@ class AimeLeonDoreScraper:
                     if title_elem:
                         product_data['title'] = title_elem.get_text(strip=True).replace(' | Aimé Leon Dore', '')
 
-                # Price
-                price_elem = soup.find('span', {'class': re.compile(r'price', re.I)}) or \
-                           soup.find('meta', {'property': 'product:price:amount'})
-                if price_elem:
-                    if price_elem.name == 'meta':
-                        price_text = price_elem.get('content', '')
-                    else:
-                        price_text = price_elem.get_text(strip=True)
-
-                    # Extract numeric price
-                    price_match = re.search(r'\$?(\d+(?:,\d{3})*(?:\.\d{2})?)', price_text.replace(',', ''))
-                    if price_match:
-                        product_data['price'] = float(price_match.group(1))
-                    else:
-                        product_data['price'] = None
-                else:
-                    product_data['price'] = None
+                # Price - extract all currencies as "20USD,450CZK,75PLN,..."
+                product_data['price'] = self._extract_multi_currency_prices(soup, is_sale=False)
+                product_data['sale'] = self._extract_multi_currency_prices(soup, is_sale=True)
+                # Fallback: if no structured price found, try first price-like span + USD
+                if not product_data['price']:
+                    fallback = soup.find('span', {'class': re.compile(r'price', re.I)}) or \
+                               soup.find('meta', {'property': 'product:price:amount'})
+                    if fallback:
+                        raw = fallback.get('content') if fallback.name == 'meta' else fallback.get_text(strip=True)
+                        if raw:
+                            m = re.search(r'[\$]?(\d+(?:\.\d{2})?)', str(raw).replace(',', ''))
+                            if m:
+                                product_data['price'] = self._format_price_part(float(m.group(1)), 'USD')
 
                 # Image URL
                 image_elem = soup.find('meta', {'property': 'og:image'}) or \
@@ -479,7 +588,7 @@ class AimeLeonDoreScraper:
                             except (json.JSONDecodeError, TypeError):
                                 pass
 
-                        # Prepare data for Supabase
+                        # Prepare data for Supabase (price/sale are text: "20USD,450CZK,75PLN,...")
                         db_product = {
                             'id': product['id'],
                             'source': 'scraper',
@@ -490,8 +599,8 @@ class AimeLeonDoreScraper:
                             'description': product.get('description'),
                             'category': product.get('category'),
                             'gender': 'man',
-                            'price': product.get('price'),
-                            'currency': 'USD',
+                            'price': product.get('price'),  # text: "20USD,450CZK,75PLN,..."
+                            'sale': product.get('sale'),    # text or null: "15USD,350CZK,..." when on sale
                             'second_hand': False,
                             'metadata': product.get('metadata'),
                             'size': product.get('size'),
