@@ -457,33 +457,54 @@ class AimeLeonDoreScraper:
                             if m:
                                 product_data['price'] = self._format_price_part(float(m.group(1)), 'USD')
 
-                # All product images: main image for image_url + image_embedding, rest for additional_images
+                # Product images and product_type: prefer Shopify product JSON
                 all_image_urls = []
-                # 1) og:image is usually the main product image
-                og_image = soup.find('meta', {'property': 'og:image'})
-                if og_image and og_image.get('content'):
-                    main_url = og_image.get('content')
-                    if main_url.startswith('/'):
-                        main_url = urljoin(BASE_URL, main_url)
-                    all_image_urls.append(main_url)
-                # 2) Gallery / product images (img in product area, data-src, src)
-                for img in soup.find_all('img', {'class': re.compile(r'product|gallery|thumbnail|media', re.I)}):
-                    for attr in ('data-src', 'src'):
-                        src = img.get(attr)
-                        if src and src.strip():
-                            full = urljoin(BASE_URL, src) if src.startswith('/') else src
-                            if full not in all_image_urls:
-                                all_image_urls.append(full)
-                # 3) Any img inside product container
-                product_container = soup.find('div', class_=re.compile(r'product|gallery|media', re.I))
-                if product_container:
-                    for img in product_container.find_all('img'):
+                product_type_from_json = None
+                json_url = (product_url.split('?')[0].rstrip('/') + '.json')
+                try:
+                    async with session.get(json_url, headers=headers, timeout=15) as json_resp:
+                        if json_resp.status == 200:
+                            json_data = await json_resp.json()
+                            prod = json_data.get('product', json_data)
+                            if isinstance(prod, dict):
+                                product_type_from_json = (prod.get('product_type') or prod.get('type') or '').strip() or None
+                                img_list = prod.get('images') or []
+                                if not img_list and prod.get('image'):
+                                    img_list = [prod['image']]
+                                for img in img_list:
+                                    if isinstance(img, dict):
+                                        src = img.get('src') or img.get('url')
+                                    else:
+                                        src = img
+                                    if src and isinstance(src, str) and src.strip():
+                                        full = urljoin(BASE_URL, src) if src.startswith('/') else (src if src.startswith('http') else 'https:' + src)
+                                        if full not in all_image_urls:
+                                            all_image_urls.append(full)
+                except (Exception, json.JSONDecodeError) as e:
+                    logger.debug(f"Product JSON not available for {product_url}: {e}")
+                if not all_image_urls:
+                    og_image = soup.find('meta', {'property': 'og:image'})
+                    if og_image and og_image.get('content'):
+                        main_url = og_image.get('content')
+                        if main_url.startswith('/'):
+                            main_url = urljoin(BASE_URL, main_url)
+                        all_image_urls.append(main_url)
+                    for img in soup.find_all('img', {'class': re.compile(r'product|gallery|thumbnail|media', re.I)}):
                         for attr in ('data-src', 'src'):
                             src = img.get(attr)
                             if src and src.strip():
                                 full = urljoin(BASE_URL, src) if src.startswith('/') else src
                                 if full not in all_image_urls:
                                     all_image_urls.append(full)
+                    product_container = soup.find('div', class_=re.compile(r'product|gallery|media', re.I))
+                    if product_container:
+                        for img in product_container.find_all('img'):
+                            for attr in ('data-src', 'src'):
+                                src = img.get(attr)
+                                if src and src.strip():
+                                    full = urljoin(BASE_URL, src) if src.startswith('/') else src
+                                    if full not in all_image_urls:
+                                        all_image_urls.append(full)
                 if all_image_urls:
                     product_data['image_url'] = all_image_urls[0]
                     product_data['additional_images'] = all_image_urls[1:]
@@ -494,15 +515,36 @@ class AimeLeonDoreScraper:
                 product_data['description'] = desc_elem.get('content') if desc_elem and desc_elem.name == 'meta' else \
                                             desc_elem.get_text(strip=True) if desc_elem else None
 
-                # Category: actual categories from breadcrumbs, product type, collection; comma-separated
+                # Category: only real categories (pants, sweaters, hoodies, etc.), not product names
+                KNOWN_CATEGORIES = {
+                    'tees & polos', 'tees', 'polos', 'sweatshirts', 'sweatshirt', 'shirting',
+                    'sweaters', 'sweater', 'hoodies', 'hoodie', 'pants', 'sweatpants', 'sweats',
+                    'shorts', 'outerwear', 'suiting', 'suits', 'footwear', 'headwear', 'hats',
+                    'jewelry', 'bags & leather goods', 'bags', 'accessories', 'gift cards',
+                    'new arrivals', 'kids', 'uniform', 'curated selects', 'winter essentials',
+                }
                 category_parts = []
+                title_lower = (product_data.get('title') or '').lower()
+                def is_valid_category(t: str) -> bool:
+                    if not t or len(t) > 50:
+                        return False
+                    t_lower = t.lower()
+                    if t_lower in ('home', 'shop', 'shop all', 'collections', 'discover'):
+                        return False
+                    if t_lower.startswith('ald ') or 'ornament' in t_lower or 'ballpark' in t_lower:
+                        return False
+                    if title_lower and t_lower in title_lower:
+                        return False
+                    return True
+                if product_type_from_json and is_valid_category(product_type_from_json):
+                    category_parts.append(product_type_from_json.strip())
                 category_elem = soup.find('nav', {'class': re.compile(r'breadcrumb', re.I)})
                 if category_elem:
                     for a in category_elem.find_all('a'):
                         t = a.get_text(strip=True)
-                        if t and t.lower() not in ('home', 'shop', 'shop all'):
-                            category_parts.append(t)
-                # Product type / collection from meta or JSON-LD
+                        if t and is_valid_category(t) and t not in category_parts:
+                            if any(k in t.lower() for k in KNOWN_CATEGORIES) or len(t) < 25:
+                                category_parts.append(t)
                 for script in soup.find_all('script', type='application/ld+json'):
                     try:
                         data = json.loads(script.string) if script.string else {}
@@ -510,25 +552,13 @@ class AimeLeonDoreScraper:
                             data = [data]
                         for item in data:
                             if item.get('@type') == 'Product':
-                                for key in ('category', 'productType', 'additionalProperty'):
+                                for key in ('category', 'productType'):
                                     val = item.get(key)
-                                    if isinstance(val, str) and val.strip() and val not in category_parts:
-                                        category_parts.append(val.strip())
-                                    elif isinstance(val, list):
-                                        for v in val:
-                                            if isinstance(v, dict) and v.get('name'):
-                                                category_parts.append(v['name'].strip())
-                                            elif isinstance(v, str) and v.strip() and v not in category_parts:
-                                                category_parts.append(v.strip())
+                                    if isinstance(val, str) and val.strip() and is_valid_category(val) and val.strip() not in category_parts:
+                                        if any(k in val.lower() for k in KNOWN_CATEGORIES) or len(val) < 25:
+                                            category_parts.append(val.strip())
                     except (json.JSONDecodeError, TypeError):
                         continue
-                # URL path segments (e.g. /collections/sweaters-hoodies/)
-                url_parts = urlparse(product_url).path.strip('/').split('/')
-                for seg in url_parts:
-                    if seg and seg not in ('products', 'collections'):
-                        label = seg.replace('-', ' ').title()
-                        if label and label not in category_parts:
-                            category_parts.append(label)
                 product_data['category'] = ', '.join(category_parts) if category_parts else None
 
                 # Size information (if available)
@@ -695,14 +725,14 @@ class AimeLeonDoreScraper:
                             'second_hand': False,
                             'metadata': product.get('metadata'),
                             'size': product.get('size'),
-                            'country': 'US',
+                            'country': None,
                             'image_embedding': image_embedding,
                             'additional_images': additional_images_str,
                             'info_embedding': info_embedding,
                         }
 
-                        # Remove None values
-                        db_product = {k: v for k, v in db_product.items() if v is not None}
+                        # Remove None values except country (we always set country to NULL)
+                        db_product = {k: v for k, v in db_product.items() if v is not None or k == 'country'}
 
                         # Insert into Supabase with better error handling
                         try:
