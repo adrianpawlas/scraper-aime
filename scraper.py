@@ -272,6 +272,36 @@ class AimeLeonDoreScraper:
             logger.error(f"Error generating embedding: {e}")
             return None
 
+    def generate_text_embedding(self, text: str) -> Optional[List[float]]:
+        """Generate 768-dimensional text embedding using the same SigLIP model (text encoder)."""
+        if not text or not text.strip():
+            return None
+        try:
+            # SigLIP expects both image and text; use a minimal placeholder image and take text_embeds
+            placeholder = Image.new("RGB", (384, 384), (0, 0, 0))
+            inputs = self.processor(
+                text=[text.strip()],
+                images=placeholder,
+                padding="max_length",
+                return_tensors="pt",
+                truncation=True,
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+            if hasattr(outputs, "text_embeds"):
+                embedding = outputs.text_embeds
+            else:
+                return None
+            embedding = embedding.cpu().numpy().flatten()
+            if len(embedding) != 768:
+                logger.warning(f"Text embedding dimension is {len(embedding)}, expected 768")
+                return None
+            return embedding.tolist()
+        except Exception as e:
+            logger.error(f"Error generating text embedding: {e}")
+            return None
+
     def _parse_price_with_currency(self, text: str) -> Optional[Tuple[float, str]]:
         """Parse price string to (value, currency_code). Returns None if not parseable."""
         if not text or not isinstance(text, str):
@@ -427,16 +457,36 @@ class AimeLeonDoreScraper:
                             if m:
                                 product_data['price'] = self._format_price_part(float(m.group(1)), 'USD')
 
-                # Image URL
-                image_elem = soup.find('meta', {'property': 'og:image'}) or \
-                           soup.find('img', {'class': re.compile(r'product.*image', re.I)})
-                if image_elem:
-                    if image_elem.name == 'meta':
-                        product_data['image_url'] = image_elem.get('content')
-                    else:
-                        img_src = image_elem.get('src') or image_elem.get('data-src')
-                        if img_src:
-                            product_data['image_url'] = urljoin(BASE_URL, img_src) if img_src.startswith('/') else img_src
+                # All product images: main image for image_url + image_embedding, rest for additional_images
+                all_image_urls = []
+                # 1) og:image is usually the main product image
+                og_image = soup.find('meta', {'property': 'og:image'})
+                if og_image and og_image.get('content'):
+                    main_url = og_image.get('content')
+                    if main_url.startswith('/'):
+                        main_url = urljoin(BASE_URL, main_url)
+                    all_image_urls.append(main_url)
+                # 2) Gallery / product images (img in product area, data-src, src)
+                for img in soup.find_all('img', {'class': re.compile(r'product|gallery|thumbnail|media', re.I)}):
+                    for attr in ('data-src', 'src'):
+                        src = img.get(attr)
+                        if src and src.strip():
+                            full = urljoin(BASE_URL, src) if src.startswith('/') else src
+                            if full not in all_image_urls:
+                                all_image_urls.append(full)
+                # 3) Any img inside product container
+                product_container = soup.find('div', class_=re.compile(r'product|gallery|media', re.I))
+                if product_container:
+                    for img in product_container.find_all('img'):
+                        for attr in ('data-src', 'src'):
+                            src = img.get(attr)
+                            if src and src.strip():
+                                full = urljoin(BASE_URL, src) if src.startswith('/') else src
+                                if full not in all_image_urls:
+                                    all_image_urls.append(full)
+                if all_image_urls:
+                    product_data['image_url'] = all_image_urls[0]
+                    product_data['additional_images'] = all_image_urls[1:]
 
                 # Description
                 desc_elem = soup.find('meta', {'name': 'description'}) or \
@@ -444,16 +494,42 @@ class AimeLeonDoreScraper:
                 product_data['description'] = desc_elem.get('content') if desc_elem and desc_elem.name == 'meta' else \
                                             desc_elem.get_text(strip=True) if desc_elem else None
 
-                # Category (try to extract from breadcrumbs or URL)
+                # Category: actual categories from breadcrumbs, product type, collection; comma-separated
+                category_parts = []
                 category_elem = soup.find('nav', {'class': re.compile(r'breadcrumb', re.I)})
                 if category_elem:
-                    categories = [a.get_text(strip=True) for a in category_elem.find_all('a')]
-                    product_data['category'] = ' > '.join(categories[1:]) if len(categories) > 1 else None
-                else:
-                    # Extract from URL
-                    url_parts = urlparse(product_url).path.split('/')
-                    if len(url_parts) >= 3:
-                        product_data['category'] = url_parts[2].replace('-', ' ').title()
+                    for a in category_elem.find_all('a'):
+                        t = a.get_text(strip=True)
+                        if t and t.lower() not in ('home', 'shop', 'shop all'):
+                            category_parts.append(t)
+                # Product type / collection from meta or JSON-LD
+                for script in soup.find_all('script', type='application/ld+json'):
+                    try:
+                        data = json.loads(script.string) if script.string else {}
+                        if isinstance(data, dict):
+                            data = [data]
+                        for item in data:
+                            if item.get('@type') == 'Product':
+                                for key in ('category', 'productType', 'additionalProperty'):
+                                    val = item.get(key)
+                                    if isinstance(val, str) and val.strip() and val not in category_parts:
+                                        category_parts.append(val.strip())
+                                    elif isinstance(val, list):
+                                        for v in val:
+                                            if isinstance(v, dict) and v.get('name'):
+                                                category_parts.append(v['name'].strip())
+                                            elif isinstance(v, str) and v.strip() and v not in category_parts:
+                                                category_parts.append(v.strip())
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                # URL path segments (e.g. /collections/sweaters-hoodies/)
+                url_parts = urlparse(product_url).path.strip('/').split('/')
+                for seg in url_parts:
+                    if seg and seg not in ('products', 'collections'):
+                        label = seg.replace('-', ' ').title()
+                        if label and label not in category_parts:
+                            category_parts.append(label)
+                product_data['category'] = ', '.join(category_parts) if category_parts else None
 
                 # Size information (if available)
                 size_elem = soup.find('select', {'name': re.compile(r'size', re.I)}) or \
@@ -561,15 +637,13 @@ class AimeLeonDoreScraper:
                 # Process embeddings and store
                 for product in tqdm(valid_products, desc="Processing products"):
                     try:
-                        # Download image and generate embedding
+                        # Download main image and generate image_embedding (main image only)
                         if product.get('image_url'):
                             image_bytes = await self.download_image(session, product['image_url'])
                             if image_bytes:
-                                embedding = self.generate_embedding(image_bytes)
-                                if embedding:
-                                    product['embedding'] = embedding
-                                else:
-                                    logger.warning(f"Failed to generate embedding for {product['id']}")
+                                image_embedding = self.generate_embedding(image_bytes)
+                                if not image_embedding:
+                                    logger.warning(f"Failed to generate image embedding for {product['id']}")
                                     continue
                             else:
                                 logger.warning(f"Failed to download image for {product['id']}")
@@ -577,6 +651,23 @@ class AimeLeonDoreScraper:
                         else:
                             logger.warning(f"No image URL for {product['id']}")
                             continue
+
+                        # Info text for info_embedding (title, price, description, category, etc.)
+                        info_parts = [
+                            product.get('title') or '',
+                            product.get('description') or '',
+                            product.get('category') or '',
+                            product.get('price') or '',
+                            product.get('sale') or '',
+                            product.get('size') or '',
+                            product.get('brand') or 'Aime',
+                        ]
+                        info_text = ' '.join(p for p in info_parts if p).strip()
+                        info_embedding = self.generate_text_embedding(info_text) if info_text else None
+
+                        # additional_images: "url1 , url2 , url3"
+                        additional_images = product.get('additional_images') or []
+                        additional_images_str = (' , '.join(additional_images)) if additional_images else None
 
                         # Extract product URL - prefer direct field, fallback to metadata
                         product_url = product.get('url')
@@ -588,7 +679,7 @@ class AimeLeonDoreScraper:
                             except (json.JSONDecodeError, TypeError):
                                 pass
 
-                        # Prepare data for Supabase (price/sale are text: "20USD,450CZK,75PLN,...")
+                        # Prepare data for Supabase (price/sale text: "100USD,2500CZK,500PLN,...")
                         db_product = {
                             'id': product['id'],
                             'source': 'scraper',
@@ -599,13 +690,15 @@ class AimeLeonDoreScraper:
                             'description': product.get('description'),
                             'category': product.get('category'),
                             'gender': 'man',
-                            'price': product.get('price'),  # text: "20USD,450CZK,75PLN,..."
-                            'sale': product.get('sale'),    # text or null: "15USD,350CZK,..." when on sale
+                            'price': product.get('price'),
+                            'sale': product.get('sale'),
                             'second_hand': False,
                             'metadata': product.get('metadata'),
                             'size': product.get('size'),
                             'country': 'US',
-                            'embedding': product['embedding']
+                            'image_embedding': image_embedding,
+                            'additional_images': additional_images_str,
+                            'info_embedding': info_embedding,
                         }
 
                         # Remove None values
