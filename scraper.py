@@ -2,20 +2,25 @@
 """
 Aimé Leon Dore Product Scraper
 Scrapes all products from aimeleondore.com and stores them in Supabase with image embeddings.
+
+Uses PostgREST HTTP API directly (not Supabase SDK) for reliable behavior in automated runs.
+Implements smart sync: insert new products only (don't overwrite existing), remove stale products.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import cloudscraper
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from fake_useragent import UserAgent
 from loguru import logger
 from selenium import webdriver
@@ -23,7 +28,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from supabase import create_client
 from tqdm.asyncio import tqdm
 from webdriver_manager.chrome import ChromeDriverManager
 
@@ -33,20 +37,39 @@ import torch
 from PIL import Image
 import io
 
+# Load env from project dir so it works in cron (CWD may differ)
+from pathlib import Path
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+
 # Constants
 BASE_URL = "https://www.aimeleondore.com"
 SHOP_ALL_URL = "https://www.aimeleondore.com/collections/shop-all"
-SUPABASE_URL = "https://yqawmzggcgpeyaaynrjk.supabase.co"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlxYXdtemdnY2dwZXlhYXlucmprIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTAxMDkyNiwiZXhwIjoyMDcwNTg2OTI2fQ.XtLpxausFriraFJeX27ZzsdQsFv3uQKXBBggoz6P4D4"
+SOURCE = "scraper"  # Table source column (shared with other scrapers)
+BRAND = "Aime"      # This scraper's brand; (source, brand) identifies our rows for sync
+
+# Supabase: from env (required for reliable automated runs)
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY") or ""
 
 # Embedding model
 EMBEDDING_MODEL_NAME = "google/siglip-base-patch16-384"
 
 class AimeLeonDoreScraper:
     def __init__(self):
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError(
+                "Set SUPABASE_URL and SUPABASE_KEY (or SUPABASE_ANON_KEY) in .env or environment. "
+                "Required for imports in automated runs."
+            )
         self.ua = UserAgent()
         self.scraper = cloudscraper.create_scraper()
-        self.supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+        # PostgREST HTTP session (more reliable than SDK in cron/automated runs)
+        self._session = requests.Session()
+        self._session.headers.update({
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+        })
 
         # Initialize embedding model
         logger.info("Loading embedding model...")
@@ -615,11 +638,9 @@ class AimeLeonDoreScraper:
 
                 product_data['metadata'] = json.dumps(metadata)
 
-                # Generate ID from URL
-                product_id = urlparse(product_url).path.split('/')[-1]
-                if not product_id:
-                    product_id = str(hash(product_url)) % 1000000
-                product_data['id'] = f"aime-{product_id}"
+                # Stable deterministic ID (scraper-specific prefix avoids collision with other scrapers)
+                id_string = f"aime:{product_url}"
+                product_data['id'] = hashlib.sha256(id_string.encode("utf-8")).hexdigest()
                 product_data['url'] = product_url  # Store URL directly for easier access
 
                 return product_data
@@ -628,162 +649,233 @@ class AimeLeonDoreScraper:
             logger.error(f"Error scraping product {product_url}: {e}")
             return None
 
+    def _upsert_products_http(self, products: List[dict], insert_only: bool = True) -> bool:
+        """
+        Insert products via PostgREST HTTP.
+        insert_only=True: resolution=ignore-duplicates (new only, don't overwrite existing).
+        """
+        if not products:
+            return True
+        # Normalize: same keys in every object (PostgREST requirement)
+        all_keys = set()
+        for p in products:
+            all_keys.update(p.keys())
+        normalized = [{k: p.get(k) for k in all_keys} for p in products]
+        endpoint = f"{SUPABASE_URL}/rest/v1/products"
+        prefer = "resolution=ignore-duplicates,return=minimal" if insert_only else "resolution=merge-duplicates,return=minimal"
+        chunk_size = 50
+        for i in range(0, len(normalized), chunk_size):
+            chunk = normalized[i : i + chunk_size]
+            try:
+                r = self._session.post(
+                    endpoint,
+                    headers={"Prefer": prefer},
+                    data=json.dumps(chunk),
+                    timeout=90,
+                )
+                if r.status_code not in (200, 201, 204):
+                    # Retry failed batch one row at a time
+                    logger.warning(f"Batch failed {r.status_code} {r.text[:500]}, retrying row-by-row")
+                    for row in chunk:
+                        rr = self._session.post(
+                            endpoint,
+                            headers={"Prefer": prefer},
+                            data=json.dumps([row]),
+                            timeout=60,
+                        )
+                        if rr.status_code not in (200, 201, 204):
+                            logger.error(f"Row failed: {rr.status_code} {rr.text[:300]}")
+                            return False
+                else:
+                    logger.debug(f"Inserted chunk {i // chunk_size + 1} ({len(chunk)} rows)")
+            except Exception as e:
+                logger.error(f"HTTP upsert error: {e}")
+                return False
+        return True
+
+    def _delete_stale_products(self, current_ids: Set[str]) -> int:
+        """
+        Remove products for this scraper (source + brand) that are no longer in the catalog.
+        Only deletes rows where source=SOURCE AND brand=BRAND and id NOT IN current_ids.
+        """
+        if not current_ids:
+            return 0
+        endpoint = f"{SUPABASE_URL}/rest/v1/products"
+        try:
+            r = self._session.get(
+                f"{endpoint}?source=eq.{SOURCE}&brand=eq.{BRAND}&select=id",
+                timeout=60,
+            )
+            if r.status_code != 200:
+                logger.warning(f"Could not fetch existing ids: {r.status_code}")
+                return 0
+            existing = r.json() if isinstance(r.json(), list) else []
+            existing_ids = {row["id"] for row in existing if row.get("id")}
+            to_delete = existing_ids - current_ids
+        except Exception as e:
+            logger.error(f"Error fetching existing products: {e}")
+            return 0
+        if not to_delete:
+            return 0
+        deleted = 0
+        # PostgREST: delete in batches (filter length limits)
+        batch_size = 100
+        to_delete_list = list(to_delete)
+        for i in range(0, len(to_delete_list), batch_size):
+            batch = to_delete_list[i : i + batch_size]
+            ids_param = ",".join(batch)
+            try:
+                r = self._session.delete(
+                    f"{endpoint}?source=eq.{SOURCE}&brand=eq.{BRAND}&id=in.({ids_param})",
+                    timeout=60,
+                )
+                if r.status_code in (200, 204):
+                    deleted += len(batch)
+                else:
+                    logger.warning(f"Delete batch failed: {r.status_code} {r.text[:300]}")
+            except Exception as e:
+                logger.error(f"Delete error: {e}")
+        if deleted:
+            logger.info(f"Removed {deleted} stale products no longer in catalog")
+        return deleted
+
     async def process_products(self, product_urls: List[str], batch_size: int = 10) -> int:
         """Process all products: scrape details, generate embeddings, and store in database.
-        
-        Returns:
-            int: Number of products successfully processed and stored
+        Smart sync: inserts new products only (doesn't overwrite existing), removes stale products.
         """
         logger.info(f"Processing {len(product_urls)} products...")
         products_stored = 0
+        current_ids: Set[str] = set()
+        db_batch: List[dict] = []
+        db_batch_size = 50
 
         async with aiohttp.ClientSession() as session:
-            # Process in batches to avoid overwhelming the server
             for i in range(0, len(product_urls), batch_size):
                 batch_urls = product_urls[i:i + batch_size]
                 logger.info(f"Processing batch {i//batch_size + 1}/{(len(product_urls) + batch_size - 1)//batch_size}")
 
-                tasks = []
-                for url in batch_urls:
-                    tasks.append(self.scrape_product_details(session, url))
-
-                # Scrape product details
+                tasks = [self.scrape_product_details(session, url) for url in batch_urls]
                 batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Filter out exceptions, None results, and sold-out products
                 valid_products = []
                 for result in batch_results:
                     if isinstance(result, Exception):
                         logger.error(f"Exception in batch: {result}")
-                    elif result is not None:
-                        # Skip sold-out products
-                        if result.get('is_sold_out', False):
-                            logger.info(f"Skipping sold-out product: {result.get('title', 'Unknown')}")
-                            continue
+                    elif result is not None and not result.get("is_sold_out", False):
                         valid_products.append(result)
+                    elif result is not None and result.get("is_sold_out", False):
+                        logger.info(f"Skipping sold-out product: {result.get('title', 'Unknown')}")
 
                 logger.info(f"Valid products in batch: {len(valid_products)}")
 
-                # Process embeddings and store
                 for product in tqdm(valid_products, desc="Processing products"):
                     try:
-                        # Download main image and generate image_embedding (main image only)
-                        if product.get('image_url'):
-                            image_bytes = await self.download_image(session, product['image_url'])
-                            if image_bytes:
-                                image_embedding = self.generate_embedding(image_bytes)
-                                if not image_embedding:
-                                    logger.warning(f"Failed to generate image embedding for {product['id']}")
-                                    continue
-                            else:
-                                logger.warning(f"Failed to download image for {product['id']}")
-                                continue
-                        else:
+                        if not product.get("image_url"):
                             logger.warning(f"No image URL for {product['id']}")
                             continue
+                        image_bytes = await self.download_image(session, product["image_url"])
+                        if not image_bytes:
+                            logger.warning(f"Failed to download image for {product['id']}")
+                            continue
+                        image_embedding = self.generate_embedding(image_bytes)
+                        if not image_embedding:
+                            logger.warning(f"Failed to generate image embedding for {product['id']}")
+                            continue
 
-                        # Info text for info_embedding (title, price, description, category, etc.)
                         info_parts = [
-                            product.get('title') or '',
-                            product.get('description') or '',
-                            product.get('category') or '',
-                            product.get('price') or '',
-                            product.get('sale') or '',
-                            product.get('size') or '',
-                            product.get('brand') or 'Aime',
+                            product.get("title") or "",
+                            product.get("description") or "",
+                            product.get("category") or "",
+                            product.get("price") or "",
+                            product.get("sale") or "",
+                            product.get("size") or "",
+                            product.get("brand") or BRAND,
                         ]
-                        info_text = ' '.join(p for p in info_parts if p).strip()
+                        info_text = " ".join(p for p in info_parts if p).strip()
                         info_embedding = self.generate_text_embedding(info_text) if info_text else None
 
-                        # additional_images: "url1 , url2 , url3"
-                        additional_images = product.get('additional_images') or []
-                        additional_images_str = (' , '.join(additional_images)) if additional_images else None
+                        additional_images = product.get("additional_images") or []
+                        additional_images_str = (" , ".join(additional_images)) if additional_images else None
 
-                        # Extract product URL - prefer direct field, fallback to metadata
-                        product_url = product.get('url')
-                        if not product_url:
+                        product_url = product.get("url")
+                        if not product_url and product.get("metadata"):
                             try:
-                                if product.get('metadata'):
-                                    metadata_dict = json.loads(product['metadata'])
-                                    product_url = metadata_dict.get('url')
+                                product_url = json.loads(product["metadata"]).get("url")
                             except (json.JSONDecodeError, TypeError):
                                 pass
 
-                        # Prepare data for Supabase (price/sale text: "100USD,2500CZK,500PLN,...")
                         db_product = {
-                            'id': product['id'],
-                            'source': 'scraper',
-                            'product_url': product_url,
-                            'image_url': product['image_url'],
-                            'brand': 'Aime',
-                            'title': product['title'],
-                            'description': product.get('description'),
-                            'category': product.get('category'),
-                            'gender': 'man',
-                            'price': product.get('price'),
-                            'sale': product.get('sale'),
-                            'second_hand': False,
-                            'metadata': product.get('metadata'),
-                            'size': product.get('size'),
-                            'country': None,
-                            'image_embedding': image_embedding,
-                            'additional_images': additional_images_str,
-                            'info_embedding': info_embedding,
+                            "id": product["id"],
+                            "source": SOURCE,
+                            "product_url": product_url,
+                            "image_url": product["image_url"],
+                            "brand": BRAND,
+                            "title": product["title"],
+                            "description": product.get("description"),
+                            "category": product.get("category"),
+                            "gender": "man",
+                            "price": product.get("price"),
+                            "sale": product.get("sale"),
+                            "second_hand": False,
+                            "metadata": product.get("metadata"),
+                            "size": product.get("size"),
+                            "country": None,
+                            "image_embedding": image_embedding,
+                            "additional_images": additional_images_str,
+                            "info_embedding": info_embedding,
                         }
+                        db_product = {k: v for k, v in db_product.items() if v is not None or k == "country"}
 
-                        # Remove None values except country (we always set country to NULL)
-                        db_product = {k: v for k, v in db_product.items() if v is not None or k == 'country'}
+                        current_ids.add(product["id"])
+                        db_batch.append(db_product)
+                        products_stored += 1
 
-                        # Insert into Supabase with better error handling
-                        try:
-                            result = self.supabase.table('products').upsert(db_product).execute()
-                            
-                            # Check if insertion was successful
-                            if hasattr(result, 'data') and result.data:
-                                logger.info(f"Successfully stored product: {product['title']} (ID: {product['id']})")
-                                products_stored += 1
-                            elif hasattr(result, 'data') and result.data == []:
-                                # Empty response might still be success for upsert
-                                logger.info(f"Upsert completed for product: {product['title']} (ID: {product['id']})")
-                                products_stored += 1
+                        if len(db_batch) >= db_batch_size:
+                            if self._upsert_products_http(db_batch, insert_only=True):
+                                logger.info(f"Inserted batch of {len(db_batch)} products")
                             else:
-                                logger.warning(f"Unexpected response for product {product['title']}: {result}")
-                                
-                            # Log the actual response for debugging (only in debug mode)
-                            if logger.level == "DEBUG":
-                                logger.debug(f"Supabase response: {result}")
-                            
-                        except Exception as db_error:
-                            logger.error(f"Database error storing product {product['title']} (ID: {product['id']}): {db_error}")
-                            logger.error(f"Product data: {db_product}")
-                            raise  # Re-raise to see the full error
+                                logger.error("Batch insert failed")
+                            db_batch = []
 
                     except Exception as e:
                         logger.error(f"Error processing product {product.get('id', 'unknown')}: {e}")
 
-                # Small delay between batches
                 await asyncio.sleep(1)
 
+        if db_batch:
+            if self._upsert_products_http(db_batch, insert_only=True):
+                logger.info(f"Inserted final batch of {len(db_batch)} products")
+            else:
+                logger.error("Final batch insert failed")
+
+        self._delete_stale_products(current_ids)
         logger.info(f"Processing complete. Successfully stored {products_stored} products.")
         return products_stored
 
     async def verify_database_insertion(self, expected_count: int):
         """Verify that products were actually inserted into the database."""
         try:
-            # Query products with source='scraper' and brand='Aime' from today
-            result = self.supabase.table('products').select('id', count='exact').eq('source', 'scraper').eq('brand', 'Aime').execute()
-            
-            total_count = result.count if hasattr(result, 'count') else len(result.data) if result.data else 0
-            
-            logger.info(f"Database verification: Found {total_count} products in database (expected at least {expected_count})")
-            
+            endpoint = f"{SUPABASE_URL}/rest/v1/products"
+            r = self._session.get(
+                f"{endpoint}?source=eq.{SOURCE}&brand=eq.{BRAND}&select=id",
+                headers={"Prefer": "count=exact"},
+                timeout=30,
+            )
+            if r.status_code != 200:
+                logger.warning(f"Verification request failed: {r.status_code}")
+                return
+            data = r.json() if isinstance(r.json(), list) else []
+            total_count = len(data)
+            content_range = r.headers.get("Content-Range", "")
+            if "/" in content_range:
+                total_count = int(content_range.split("/")[-1])
+            logger.info(f"Database verification: Found {total_count} products (expected at least {expected_count})")
             if total_count == 0:
                 logger.warning("⚠️  No products found in database! There may be an insertion issue.")
             elif total_count < expected_count:
-                logger.warning(f"⚠️  Only {total_count} products found, expected {expected_count}. Some products may not have been inserted.")
+                logger.warning(f"⚠️  Only {total_count} products found, expected {expected_count}.")
             else:
                 logger.info(f"✅ Successfully verified {total_count} products in database")
-                
         except Exception as e:
             logger.error(f"Error verifying database: {e}")
 
